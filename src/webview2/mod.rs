@@ -41,6 +41,15 @@ const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
+/// UIA's reserved `WM_GETOBJECT` object id (`UiaRootObjectId == -25`). Hardcoded so we
+/// don't have to enable the `Win32_UI_Accessibility` windows-crate feature for one const.
+const UIA_ROOT_OBJECT_ID: i32 = -25;
+
+/// Window class of the WebView2 window that hosts the live web-content accessibility
+/// (UIA/IA2) provider. It is an out-of-process descendant of the container HWND we pass
+/// to `CreateCoreWebView2Controller`.
+const WEBVIEW2_A11Y_WINDOW_CLASS: &str = "Chrome_RenderWidgetHostHWND";
+
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
     Error::WebView2Error(err)
@@ -51,6 +60,37 @@ impl From<windows::core::Error> for Error {
   fn from(err: windows::core::Error) -> Self {
     Error::WebView2Error(webview2_com::Error::WindowsError(err))
   }
+}
+
+/// `EnumChildWindows` callback: stop at the first descendant whose class is
+/// `Chrome_RenderWidgetHostHWND`, writing its HWND through the out-pointer in `lparam`.
+unsafe extern "system" fn find_webview2_a11y_hwnd_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+  let mut class_buf = [0u16; 64];
+  let len = GetClassNameW(hwnd, &mut class_buf);
+  if len > 0 {
+    let class = String::from_utf16_lossy(&class_buf[..len as usize]);
+    if class == WEBVIEW2_A11Y_WINDOW_CLASS {
+      let out = lparam.0 as *mut HWND;
+      if !out.is_null() {
+        *out = hwnd;
+      }
+      return BOOL(0); // stop enumeration
+    }
+  }
+  BOOL(1) // continue (EnumChildWindows recurses into all descendants)
+}
+
+/// Recursively search `parent`'s descendant HWNDs for the WebView2 window that hosts the
+/// web-content accessibility provider. `None` if not found (e.g. before the renderer HWND
+/// exists). wry uses windowed hosting, so the HWND exists once the controller is ready.
+unsafe fn find_webview2_a11y_hwnd(parent: HWND) -> Option<HWND> {
+  let mut found = HWND::default();
+  let _ = EnumChildWindows(
+    Some(parent),
+    Some(find_webview2_a11y_hwnd_cb),
+    LPARAM(&mut found as *mut HWND as isize),
+  );
+  (!found.0.is_null()).then_some(found)
 }
 
 pub(crate) struct InnerWebView {
@@ -1274,6 +1314,37 @@ impl InnerWebView {
             std::ptr::null::<()>() as _,
           );
         }
+      }
+
+      WM_GETOBJECT => {
+        let object_id = lparam.0 as i32;
+        // Forward only the UIA root request (NVDA / Voice Access / Narrator on
+        // Chromium 141+ / Edge 149+) and the legacy MSAA/IA2 client request. Other object
+        // ids (OBJID_WINDOW, caret, native OM, ...) keep default handling. This makes the
+        // WebView2 content tree reachable via HWND-chain traversal while the host window
+        // is backgrounded (Alt+Tab / minimize), where UIA can no longer use focus-based
+        // discovery. Purely additive: while focused, UIA reaches the tree via
+        // GetFocusedElement and never relies on this path.
+        if object_id == UIA_ROOT_OBJECT_ID || object_id == OBJID_CLIENT.0 {
+          let controller = dwrefdata as *mut ICoreWebView2Controller;
+          // Prefer the controller's container HWND; fall back to the subclassed top-level.
+          let mut container = HWND::default();
+          let search_root = if !controller.is_null()
+            && (*controller).ParentWindow(&mut container).is_ok()
+            && !container.0.is_null()
+          {
+            container
+          } else {
+            hwnd
+          };
+
+          if let Some(child) = find_webview2_a11y_hwnd(search_root) {
+            // Cross-process, UIPI-aware: WebView2's own window builds the provider and
+            // packs it into the returned LRESULT. We just relay that LRESULT.
+            return SendMessageW(child, WM_GETOBJECT, Some(wparam), Some(lparam));
+          }
+        }
+        // No WebView2 a11y window yet, or a non-UIA/-client object id: fall through.
       }
 
       _ => (),
