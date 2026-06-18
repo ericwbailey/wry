@@ -93,6 +93,54 @@ unsafe fn find_webview2_a11y_hwnd(parent: HWND) -> Option<HWND> {
   (!found.0.is_null()).then_some(found)
 }
 
+// ---------------------------------------------------------------------------------------
+// TEMP DIAGNOSTIC INSTRUMENTATION (round-7 Windows a11y investigation). Remove this whole
+// block and its callers (`a11y_diag_log` in `attach_parent_subclass` and the `WM_GETOBJECT`
+// arm of `parent_subclass_proc`) once we understand why the backgrounded UIA tree is
+// unreachable. Logs to `%TEMP%\wry-a11y.log`; inspect with `type %TEMP%\wry-a11y.log`.
+// ---------------------------------------------------------------------------------------
+
+/// Caps the (noisy) descendant-hierarchy dumps so a repeated not-found path can't spam the log.
+static A11Y_DIAG_DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Append one timestamped line to `%TEMP%\wry-a11y.log` (std only; no extra windows feature).
+fn a11y_diag_log(line: &str) {
+  use std::io::Write;
+  let ts = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0);
+  let path = std::env::temp_dir().join("wry-a11y.log");
+  if let Ok(mut f) = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(path)
+  {
+    let _ = writeln!(f, "{ts} {line}");
+  }
+}
+
+/// `EnumChildWindows` callback that logs each descendant's HWND + window class.
+unsafe extern "system" fn a11y_diag_dump_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+  let mut class_buf = [0u16; 128];
+  let len = GetClassNameW(hwnd, &mut class_buf);
+  let class = if len > 0 {
+    String::from_utf16_lossy(&class_buf[..len as usize])
+  } else {
+    String::from("<no class>")
+  };
+  a11y_diag_log(&format!(
+    "    descendant hwnd={:#x} class={}",
+    hwnd.0 as isize, class
+  ));
+  BOOL(1) // continue enumeration
+}
+
+/// Dump every descendant HWND/class of `parent` to the log (used only on the not-found path).
+unsafe fn a11y_diag_dump_descendants(parent: HWND) {
+  let _ = EnumChildWindows(Some(parent), Some(a11y_diag_dump_cb), LPARAM(0));
+}
+
 pub(crate) struct InnerWebView {
   id: String,
   parent: RefCell<HWND>,
@@ -1318,6 +1366,11 @@ impl InnerWebView {
 
       WM_GETOBJECT => {
         let object_id = lparam.0 as i32;
+        // TEMP DIAGNOSTIC (round-7): log every WM_GETOBJECT object id reaching the top-level.
+        a11y_diag_log(&format!(
+          "[WM_GETOBJECT] hwnd={:#x} objid={}",
+          hwnd.0 as isize, object_id
+        ));
         // Forward only the UIA root request (NVDA / Voice Access / Narrator on
         // Chromium 141+ / Edge 149+) and the legacy MSAA/IA2 client request. Other object
         // ids (OBJID_WINDOW, caret, native OM, ...) keep default handling. This makes the
@@ -1329,19 +1382,33 @@ impl InnerWebView {
           let controller = dwrefdata as *mut ICoreWebView2Controller;
           // Prefer the controller's container HWND; fall back to the subclassed top-level.
           let mut container = HWND::default();
-          let search_root = if !controller.is_null()
+          let (search_root, root_src) = if !controller.is_null()
             && (*controller).ParentWindow(&mut container).is_ok()
             && !container.0.is_null()
           {
-            container
+            (container, "controller-parent")
           } else {
-            hwnd
+            (hwnd, "fallback-toplevel")
           };
+          a11y_diag_log(&format!(
+            "  match objid={} search_root={:#x} ({})",
+            object_id, search_root.0 as isize, root_src
+          ));
 
           if let Some(child) = find_webview2_a11y_hwnd(search_root) {
             // Cross-process, UIPI-aware: WebView2's own window builds the provider and
             // packs it into the returned LRESULT. We just relay that LRESULT.
-            return SendMessageW(child, WM_GETOBJECT, Some(wparam), Some(lparam));
+            let lresult = SendMessageW(child, WM_GETOBJECT, Some(wparam), Some(lparam));
+            a11y_diag_log(&format!(
+              "  FOUND child hwnd={:#x}; relayed LRESULT={:#x}",
+              child.0 as isize, lresult.0
+            ));
+            return lresult;
+          } else if A11Y_DIAG_DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            a11y_diag_log(
+              "  NOT FOUND: no Chrome_RenderWidgetHostHWND under search_root. Descendants:",
+            );
+            a11y_diag_dump_descendants(search_root);
           }
         }
         // No WebView2 a11y window yet, or a non-UIA/-client object id: fall through.
@@ -1355,6 +1422,10 @@ impl InnerWebView {
 
   #[inline]
   unsafe fn attach_parent_subclass(parent: HWND, controller: &ICoreWebView2Controller) {
+    a11y_diag_log(&format!(
+      "[init] forked wry a11y build LIVE; subclassing top-level hwnd={:#x}",
+      parent.0 as isize
+    ));
     let _ = SetWindowSubclass(
       parent,
       Some(Self::parent_subclass_proc),
