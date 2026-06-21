@@ -1256,6 +1256,18 @@ impl InnerWebView {
         let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
       }
 
+      // When the top-level window is re-activated (e.g. Alt+Tab back), Windows
+      // restores keyboard focus directly to the previously-focused child window,
+      // so this window's WM_SETFOCUS does not fire and the WebView2 controller's
+      // internal focus is never restored — leaving Tab navigation dead until the
+      // user clicks into the page. WM_ACTIVATE *does* reach the top-level on
+      // re-activation, so restore the controller's focus here too. This mirrors
+      // Microsoft's documented guidance to call MoveFocus on WM_ACTIVATE.
+      WM_ACTIVATE if (wparam.0 as u32 & 0xFFFF) != WA_INACTIVE => {
+        let controller = dwrefdata as *mut ICoreWebView2Controller;
+        let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+      }
+
       msg if msg == WM_MOVE || msg == WM_MOVING => {
         let controller = dwrefdata as *mut ICoreWebView2Controller;
         let _ = (*controller).NotifyParentWindowPositionChanged();
