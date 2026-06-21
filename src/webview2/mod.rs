@@ -1253,7 +1253,8 @@ impl InnerWebView {
 
       WM_SETFOCUS | WM_ENTERSIZEMOVE => {
         let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        let r = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        tracing::info!(target: "github_app::wry_focus", msg, move_focus_ok = r.is_ok(), "wry parent_subclass_proc WM_SETFOCUS/ENTERSIZEMOVE -> MoveFocus");
       }
 
       // When the top-level window is re-activated (e.g. Alt+Tab back), Windows
@@ -1263,9 +1264,15 @@ impl InnerWebView {
       // user clicks into the page. WM_ACTIVATE *does* reach the top-level on
       // re-activation, so restore the controller's focus here too. This mirrors
       // Microsoft's documented guidance to call MoveFocus on WM_ACTIVATE.
-      WM_ACTIVATE if (wparam.0 as u32 & 0xFFFF) != WA_INACTIVE => {
-        let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+      WM_ACTIVATE => {
+        let active = (wparam.0 as u32 & 0xFFFF) != WA_INACTIVE;
+        if active {
+          let controller = dwrefdata as *mut ICoreWebView2Controller;
+          let r = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+          tracing::info!(target: "github_app::wry_focus", wparam = wparam.0, move_focus_ok = r.is_ok(), "wry parent_subclass_proc WM_ACTIVATE active -> MoveFocus");
+        } else {
+          tracing::info!(target: "github_app::wry_focus", wparam = wparam.0, "wry parent_subclass_proc WM_ACTIVATE inactive");
+        }
       }
 
       msg if msg == WM_MOVE || msg == WM_MOVING => {
